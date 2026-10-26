@@ -265,8 +265,6 @@ This was added in Kafka 3.8 ([KIP-899](https://cwiki.apache.org/confluence/displ
 6. Validate the placeholders in `ListenersValidator`: use only on `internal` listeners and only in `advertisedHostTemplate`, a known IP family, and a valid interface name.
 7. Document Pod IP listeners, including the bootstrap address, TLS, and the recommended client settings.
 8. Add unit tests, and a system test where clients keep producing and consuming through a `{nodePodIp}` listener during a rolling update of the brokers.
-
-
 ## Affected/not affected projects
 
 Only `strimzi-kafka-operator` is affected: the `advertisedHostTemplate` API description, the Cluster Operator, the `kafka-init` container, and the documentation.
