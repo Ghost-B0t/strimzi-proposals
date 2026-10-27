@@ -32,11 +32,12 @@ The proposal follows these principles:
 The broker resolves config provider references in its configuration at startup, before it registers with the KRaft controllers.
 The controllers, and the clients through the metadata, only ever see the real IP, and it is resolved again every time the Pod starts.
 Node port listeners already work this way: they advertise `${strimzifile:/opt/kafka/init/external.address:...}`, which the broker resolves from a file written by the `kafka-init` container.
+The operator ignores `advertised.listeners` when it compares the current and desired broker configuration, so a new IP after a restart doesn't trigger a rolling update.
 - The operator owns the plumbing.
 Users only choose which address to advertise, in the listener configuration.
 The operator adds whatever the broker needs to resolve it, so there is no Downward API in templates and nothing to keep in sync across node pools.
 - Only the Pods that need it change.
-The environment variable and the init container are added to broker nodes only when a listener uses the new placeholders.
+The environment variables are added to broker nodes only when a listener uses the new placeholders.
 - DNS names stay the default, and Pod IPs are opt-in.
 
 ### New placeholders
@@ -47,13 +48,15 @@ The environment variable and the init container are added to broker nodes only w
 | Placeholder                                                            | Advertised address                                                                  | Resolved through       |
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------- | ---------------------- |
 | `{nodePodIp}`                                                          | The primary Pod IP (`status.podIP`)                                                 | Environment variable   |
-| `{nodePodIp:ipv4}`, `{nodePodIp:ipv6}`                                 | The Pod IP of the given family (from `status.podIPs`)                               | `kafka-init` container |
-| `{nodePodInterfaceIp:<interface>}`, optionally with `:ipv4` or `:ipv6` | The IP on a network interface, for example one added by Multus (IPv4 if it has one) | `kafka-init` container |
+| `{nodePodIp:ipv4}`, `{nodePodIp:ipv6}`                                 | The Pod IP of the given family (from `status.podIPs`)                               | Kafka startup script   |
+| `{nodePodInterfaceIp:<interface>}`, optionally with `:ipv4` or `:ipv6` | The IP on a network interface, for example one added by Multus (IPv4 if it has one) | Kafka startup script   |
 
 
-The new placeholders are supported only on `internal` listeners.
-Clients connect to the Pod IPs directly, so the other listener types add nothing except a bootstrap address: a load balancer for `loadbalancer`, or a node IP and node port for `nodeport`, which could be supported in a follow-up.
-If a requested address doesn't exist, the init container fails, so a broker never starts with the wrong address.
+Like the existing placeholders, the new ones work on every listener type.
+Clients connect to the Pod IPs directly, so the other listener types add nothing except a bootstrap address.
+For the same reason, the operator advertises the listener port instead of the node port or port 443, unless `advertisedPortTemplate` or `brokers[].advertisedPort` is set.
+If a requested address doesn't exist, the startup script fails, so a broker never starts with the wrong address.
+Before it fails, the script retries for a limited time, for example 30 seconds, in case the address is still being assigned, such as an IPv6 address that comes from router advertisements.
 
 #### Primary Pod IP
 
@@ -94,17 +97,12 @@ configuration:
   advertisedHostTemplate: "{nodePodIp:ipv6}"
 ```
 
-The operator passes `status.podIPs` to the `kafka-init` container, which picks the IPv6 address and writes it to a file:
+The operator passes `status.podIPs` to the `kafka` container as the `STRIMZI_POD_IPS` environment variable, for example `10.0.1.12,fd00:10:0:1::12`.
+The Kafka startup script picks the IPv6 address and exports it as `STRIMZI_POD_IPV6=fd00:10:0:1::12` before it starts Kafka.
+The broker resolves it the same way as `{nodePodIp}`:
 
 ```properties
-# /opt/kafka/init/pod.address
-pod.ipv6.address=fd00:10:0:1::12
-```
-
-The broker reads the address from that file, the same way node port listeners do:
-
-```properties
-advertised.listeners=...,PODIP-9094://${strimzifile:/opt/kafka/init/pod.address:pod.ipv6.address}:9094
+advertised.listeners=...,PODIP-9094://${strimzienv:STRIMZI_POD_IPV6}:9094
 ```
 
 Nothing changes on the broker side.
@@ -152,53 +150,56 @@ spec:
           advertisedHostTemplate: "{nodePodInterfaceIp:net1}"
 ```
 
-The `kafka-init` container shares the Pod's network, so it reads the address of `net1` directly and writes it to the same file, for example `interface.net1.address=192.168.50.12`.
-The listener then advertises `${strimzifile:/opt/kafka/init/pod.address:interface.net1.address}`.
-If the interface has an IPv4 address, it is used, otherwise its IPv6 address is used.
-To always use the IPv6 address, set `{nodePodInterfaceIp:net1:ipv6}`.
+**Every broker node pool needs the network attached, because the listener applies to all brokers. Brokers without it fail to start.**
+
+The startup script reads the address of `net1` and exports it, for example `STRIMZI_INTERFACE_NET1_IP=192.168.50.12`.
+The listener then advertises `${strimzienv:STRIMZI_INTERFACE_NET1_IP}`.
+To use the IPv6 address of the interface instead of the IPv4 one, set `{nodePodInterfaceIp:net1:ipv6}`.
 
 We read the interface instead of the Multus `network-status` annotation.
 The annotation is JSON, and neither the Downward API nor Kafka's config providers can extract a value from it.
 It may also not be set yet when the container starts.
-Reading the interface needs no Kubernetes API access and no JSON parsing.
+Reading the interface avoids both problems.
 
-#### How `kafka-init` resolves the addresses
+#### How the startup script resolves the addresses
 
 The CNI, including Multus and the plugins it calls, creates the Pod's interfaces and assigns their addresses before any container starts.
-All containers in a Pod, including init containers, share the same network, so `kafka-init` sees every interface when it runs.
+All containers in a Pod share the same network, so the startup script of the `kafka` container sees every interface.
 
 No extra permissions are needed:
 
-- No Kubernetes RBAC, because `kafka-init` doesn't call the Kubernetes API for these addresses.
+- No Kubernetes RBAC, because the script doesn't call the Kubernetes API.
 - No Linux capabilities, because reading the Pod's own interfaces is unprivileged, just like running `ip addr`.
 It works as non-root with all capabilities dropped.
-- The Pod IPs come from `status.podIPs`, which the operator passes to `kafka-init` through the Downward API.
+- The Pod IPs come from `status.podIPs`, which the operator passes to the `kafka` container through the Downward API.
 
-The operator configures `kafka-init` with environment variables, as it already does for node ports:
+The operator sets two environment variables on the `kafka` container:
 
 
-| Environment variable | Value                                                                    | Set when                                         |
-| -------------------- | ------------------------------------------------------------------------ | ------------------------------------------------ |
-| `POD_IPS`            | `status.podIPs`, for example `10.0.1.12,fd00:10:0:1::12`                 | `{nodePodIp:ipv4}` or `{nodePodIp:ipv6}` is used |
-| `POD_ADDRESSES`      | The keys to write, for example `pod.ipv6.address,interface.net1.address` | Any `kafka-init` placeholder is used             |
+| Environment variable    | Value                                                                           | Set when                                                                  |
+| ----------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `STRIMZI_POD_IPS`       | `status.podIPs`                                                                 | `{nodePodIp:ipv4}` or `{nodePodIp:ipv6}` is used                          |
+| `STRIMZI_POD_ADDRESSES` | The placeholders in use, for example `nodePodIp:ipv6,nodePodInterfaceIp:net1`   | `{nodePodIp:ipv4}`, `{nodePodIp:ipv6}` or `{nodePodInterfaceIp:...}` is used |
 
 
 Linux doesn't keep a label for each address.
-It stores every address on an interface with its address family, which `ip addr` shows as `inet` (IPv4) or `inet6` (IPv6).
-Java returns each address as an `Inet4Address` or an `Inet6Address`, and the addresses in `POD_IPS` are parsed the same way, so `kafka-init` knows the family from the type of the address.
-The keys in the file are defined by Strimzi:
+It stores every address on an interface with its address family, which `ifconfig` shows as `inet` (IPv4) or `inet6` (IPv6) lines.
+The script reads IPv4 addresses with `ifconfig`, from the `net-tools` package that is already in the Kafka image, and IPv6 addresses from `/proc/net/if_inet6`.
+In `STRIMZI_POD_IPS`, the addresses that contain a `:` are IPv6.
+The script exports one environment variable per placeholder, with names defined by Strimzi:
 
 
-| Placeholder                      | Key                           |
+| Placeholder                      | Environment variable          |
 | -------------------------------- | ----------------------------- |
-| `{nodePodIp:ipv4}`               | `pod.ipv4.address`            |
-| `{nodePodIp:ipv6}`               | `pod.ipv6.address`            |
-| `{nodePodInterfaceIp:net1}`      | `interface.net1.address`      |
-| `{nodePodInterfaceIp:net1:ipv4}` | `interface.net1.ipv4.address` |
-| `{nodePodInterfaceIp:net1:ipv6}` | `interface.net1.ipv6.address` |
+| `{nodePodIp:ipv4}`               | `STRIMZI_POD_IPV4`            |
+| `{nodePodIp:ipv6}`               | `STRIMZI_POD_IPV6`            |
+| `{nodePodInterfaceIp:net1}`      | `STRIMZI_INTERFACE_NET1_IP`   |
+| `{nodePodInterfaceIp:net1:ipv4}` | `STRIMZI_INTERFACE_NET1_IPV4` |
+| `{nodePodInterfaceIp:net1:ipv6}` | `STRIMZI_INTERFACE_NET1_IPV6` |
 
+Interface names are upper-cased, and characters other than letters and digits become `_`, so `eth0.100` becomes `ETH0_100`.
 
-For interfaces, `kafka-init` first ignores loopback and link-local addresses (`169.254.0.0/16` and `fe80::/10`).
+For interfaces, the script first ignores loopback and link-local addresses (`169.254.0.0/16` and `fe80::/10`).
 Every interface with IPv6 enabled has a `fe80::` address, and other hosts can't use it to reach the broker.
 It then picks from the addresses that are left:
 
@@ -214,13 +215,11 @@ It then picks from the addresses that are left:
 | None                       | Fails                       | Fails                            | Fails                            |
 
 
-"First" means the first address Java returns for the interface, and that order isn't defined.
+"First" means the first address the script finds: `ifconfig` only shows the primary IPv4 address of an interface, and IPv6 addresses are taken in the order of `/proc/net/if_inet6`.
 Every address on the interface reaches the broker, but clients have to be able to route to the one that is picked.
 For a predictable address, keep one address per family on the interface used by the listener.
-The init container only fails when there is no address of the requested family, so a broker never starts without an address to advertise.
 
-IPv6 addresses are written as plain literals, for example `pod.ipv6.address=fd00:10:0:1::12`.  
-The `%<interface>` scope suffix that Java adds to interface addresses is removed before writing.
+The addresses in `/proc/net/if_inet6` have no colons, so the script converts them to the usual colon form, without brackets.
 
 ### TLS
 
@@ -238,6 +237,7 @@ That depends on dynamic certificate reloading, like the one discussed in [propos
 
 Pod IPs change, so clients outside the cluster still need a stable address to bootstrap from.
 Any broker can answer the first metadata request, so this can be any Service or DNS record that reaches the brokers, created by Strimzi or outside of it.
+The listener status keeps showing the internal bootstrap Service, so clients outside the cluster need the bootstrap address created for them.
 
 ### Client behavior on restarts
 
@@ -255,20 +255,19 @@ This was added in Kafka 3.8 ([KIP-899](https://cwiki.apache.org/confluence/displ
 
 1. Document the new placeholders in the `advertisedHostTemplate` description.
   The field is a plain string, so the CRD schema doesn't change.
-2. Render the placeholders in `ListenersUtils.brokerAdvertisedHost`, as `${strimzienv:STRIMZI_POD_IP}` or `${strimzifile:/opt/kafka/init/pod.address:<key>}`.
+2. Render the placeholders in `ListenersUtils.brokerAdvertisedHost`, as `${strimzienv:<VARIABLE>}` references.
   `ModelUtils.renderTemplate` is shared with volume templates, so the new placeholders stay out of it.
-3. In `KafkaCluster`, when a listener uses the placeholders, add `STRIMZI_POD_IP` to the `kafka` container with `ContainerUtils.createEnvVarFromFieldRef`, or enable the `kafka-init` container on the broker nodes and set its `POD_IPS` and `POD_ADDRESSES` environment variables.
-4. Add a `writePodAddresses` method to `InitWriter` in `kafka-init`, next to `writeExternalAddress`.
-  It resolves the keys in `POD_ADDRESSES` from `POD_IPS` and `java.net.NetworkInterface` with the rules above, and writes them to `/opt/kafka/init/pod.address`.
-   It needs no Kubernetes API access and no extra permissions.
-5. Skip templates with the new placeholders when collecting certificate SANs in `KafkaListenersReconciler`.
-6. Validate the placeholders in `ListenersValidator`: use only on `internal` listeners and only in `advertisedHostTemplate`, a known IP family, and a valid interface name.
+3. In `KafkaCluster`, when a listener uses the placeholders, add `STRIMZI_POD_IP`, or `STRIMZI_POD_IPS` and `STRIMZI_POD_ADDRESSES`, to the `kafka` container of the broker nodes.
+4. Add a `set_pod_addresses.sh` script to the Kafka image, sourced by `kafka_run.sh` before `kafka-storage.sh format`, which reads the same configuration.
+  It resolves the placeholders in `STRIMZI_POD_ADDRESSES` with the rules above, exports the variables, and logs the resolved addresses.
+  The `net-tools` entry in the Kafka Dockerfile is updated to note that the script needs `ifconfig`.
+5. In `KafkaListenersReconciler`, skip templates with the new placeholders when collecting certificate SANs, and advertise the listener port for them unless the advertised port is set by the user.
+6. Validate the placeholders in `ListenersValidator`: use only in `advertisedHostTemplate`, a known IP family, and a valid interface name that doesn't clash with another one once it is converted to a variable name.
 7. Document Pod IP listeners, including the bootstrap address, TLS, and the recommended client settings.
 8. Add unit tests, and a system test where clients keep producing and consuming through a `{nodePodIp}` listener during a rolling update of the brokers.
 ## Affected/not affected projects
 
-Only `strimzi-kafka-operator` is affected: the `advertisedHostTemplate` API description, the Cluster Operator, the `kafka-init` container, and the documentation.
-The Kafka container image doesn't change.
+Only `strimzi-kafka-operator` is affected: the `advertisedHostTemplate` API description, the Cluster Operator, the Kafka container image scripts, and the documentation.
 
 ## Compatibility
 
@@ -276,6 +275,7 @@ The feature is opt-in, and existing listeners keep advertising DNS names.
 The new placeholders don't mean anything today, so no existing configuration changes behavior.
 Templates that use `${strimzienv:...}` directly keep passing through as they are.
 Users running the webhook workaround can switch to `{nodePodIp}` and drop the webhook, which rolls the brokers once.
+Other listeners in the same cluster aren't affected, and each keeps its own advertised address.
 
 ## Rejected alternatives
 
@@ -285,6 +285,12 @@ Adding `fieldRef` to the container template would let users define the environme
 But the Downward API in templates raises security concerns, and users would have to keep the variable name in sync between the node pool templates and the listener.
 It also can't pick the IPv6 address or a secondary network address.
 The Downward API returns `status.podIPs` as a list and the Multus `network-status` as JSON, and Kafka can't extract a single address from either.
+
+### Resolving the addresses in the `kafka-init` container
+
+The `kafka-init` container could read the addresses and write them to a file, which the broker reads with `${strimzifile:...}`, like node port listeners do.
+It adds an init container that uses the operator image to every broker that needs it, which slows down the broker start, and it adds a second way to resolve addresses next to the environment variables.
+Its only advantage is that the operator image always matches the operator version, so custom Kafka images aren't a concern.
 
 ### Always setting `STRIMZI_POD_IP`
 
